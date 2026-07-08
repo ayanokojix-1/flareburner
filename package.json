@@ -1,0 +1,39 @@
+{
+  "name": "flareburner",
+  "version": "1.0.0",
+  "description": "HTTP API that uses a real Chrome browser to bypass Cloudflare challenges and return page cookies, HTML, raw binaries, or proxied requests.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "cloudflare",
+    "cloudflare-bypass",
+    "cf-clearance",
+    "scraping",
+    "scraper",
+    "puppeteer",
+    "puppeteer-real-browser",
+    "turnstile",
+    "proxy",
+    "api"
+  ],
+  "author": "arcane-nx",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arcane-nx/flareburner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/arcane-nx/flareburner/issues"
+  },
+  "homepage": "https://github.com/arcane-nx/flareburner#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "puppeteer-real-browser": "^1.4.4"
+  }
+}

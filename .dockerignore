@@ -1,0 +1,13 @@
+node_modules
+.git
+.gitignore
+.gitattributes
+.env
+json
+*.log
+*.pid
+README.md
+setup.sh
+Dockerfile
+docker-compose.yml
+.dockerignore

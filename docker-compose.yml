@@ -1,0 +1,18 @@
+services:
+  flareburner:
+    build: .
+    image: flareburner
+    container_name: flareburner
+    ports:
+      - "4001:4001"
+    environment:
+      PORT: 4001
+      HEADLESS: "false"
+      POOL_SIZE: 1
+      NAV_TIMEOUT: 60000
+      DEFAULT_URL: https://nowsecure.nl
+      # Set a key to require auth on /v1 (sent as X-API-Key or Bearer):
+      # API_KEY: change-me
+    # Chrome needs more shared memory than Docker's 64MB default.
+    shm_size: "1gb"
+    restart: unless-stopped
