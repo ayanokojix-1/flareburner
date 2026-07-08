@@ -34,6 +34,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "puppeteer-real-browser": "^1.4.4"
+    "puppeteer-real-browser": "^1.4.4",
+    "undici": "^6.21.0"
   }
 }

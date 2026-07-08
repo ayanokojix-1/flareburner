@@ -109,10 +109,18 @@ export function sanitizeCookies(cookies, url) {
  *
  * @param {object} [options]
  * @param {boolean} [options.headless=false]
+ * @param {{host:string,port:number,username?:string,password?:string}} [options.proxy]
+ *   Route the browser through a proxy. A residential/mobile proxy is what lets a
+ *   datacenter host (DO, AWS, …) pass Cloudflare — the datacenter IP is the flag,
+ *   not the fingerprint. cf_clearance harvested here is bound to the proxy IP, so
+ *   the fast-path reuse must go through the same proxy to match.
  * @returns {Promise<import('puppeteer-real-browser').ConnectResult>}
  */
-export async function connectBrowser({ headless = false } = {}) {
+export async function connectBrowser({ headless = false, proxy } = {}) {
   const chromePath = resolveChromePath();
+  // Only forward a proxy that actually has a host+port; an empty object makes
+  // puppeteer-real-browser skip --proxy-server entirely (direct connection).
+  const proxyOpt = proxy && proxy.host && proxy.port ? proxy : {};
   let browser;
   let page;
   let lastErr;
@@ -121,6 +129,7 @@ export async function connectBrowser({ headless = false } = {}) {
       ({ browser, page } = await connect({
         headless,
         turnstile: true,
+        proxy: proxyOpt,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
         customConfig: chromePath ? { chromePath } : {},
       }));
@@ -252,22 +261,43 @@ export class BrowserPool {
    * @param {object} [options]
    * @param {number} [options.size=1] Number of concurrent browsers.
    * @param {boolean} [options.headless=false]
+   * @param {{host:string,port:number,username?:string,password?:string}} [options.proxy]
+   *   Proxy for every browser in the pool (see {@link connectBrowser}).
    */
-  constructor({ size = 1, headless = false } = {}) {
+  constructor({ size = 1, headless = false, proxy } = {}) {
     this.size = Math.max(1, size);
     this.headless = headless;
+    this.proxy = proxy;
     this.slots = [];
     this.waiters = [];
   }
 
   async init() {
     for (let i = 0; i < this.size; i += 1) {
-      this.slots.push({ ...(await connectBrowser({ headless: this.headless })), busy: false });
+      this.slots.push({
+        ...(await connectBrowser({ headless: this.headless, proxy: this.proxy })),
+        busy: false,
+      });
     }
     return this;
   }
 
-  /** @returns {Promise<{browser:any,page:any,busy:boolean}>} */
+  /**
+ * Acquires a browser slot from the pool for exclusive use.
+ *
+ * If a free (non-busy) slot exists, it's claimed immediately and marked
+ * busy so no other concurrent caller can grab it in the same tick.
+ *
+ * If no slot is free, the caller is queued in `this.waiters` (FIFO) and
+ * the returned promise stays pending until `release()` hands a freed
+ * slot directly to the oldest waiter.
+ *
+ * Callers MUST call `release(slot)` when done with the returned slot,
+ * or it will never be freed and the pool will eventually starve.
+ *
+ * @returns {Promise<{browser:any,page:any,busy:boolean}>} the acquired slot
+ */
+
   acquire() {
     return new Promise((resolve) => {
       const free = this.slots.find((s) => !s.busy);
@@ -294,7 +324,7 @@ export class BrowserPool {
     } catch {
       // ignore
     }
-    const fresh = await connectBrowser({ headless: this.headless });
+    const fresh = await connectBrowser({ headless: this.headless, proxy: this.proxy });
     slot.browser = fresh.browser;
     slot.page = fresh.page;
     this.release(slot);
@@ -330,7 +360,7 @@ const DEFAULT_UA =
  * @returns {Promise<{url:string,status:number,html:string,via:string}|null>}
  */
 export async function fetchFastPath(url, opts = {}) {
-  const { cookies, userAgent, headers, timeout = 20000 } = opts;
+  const { cookies, userAgent, headers, timeout = 20000, dispatcher } = opts;
   const cookieHeader = (cookies || [])
     .filter((c) => c && c.name)
     .map((c) => `${c.name}=${c.value}`)
@@ -342,6 +372,9 @@ export async function fetchFastPath(url, opts = {}) {
     res = await fetch(url, {
       redirect: 'follow',
       signal: AbortSignal.timeout(timeout),
+      // Route through the same proxy the browser solved on — cf_clearance is
+      // IP-bound, so a direct fetch would present the wrong IP and get challenged.
+      ...(dispatcher ? { dispatcher } : {}),
       headers: {
         'user-agent': userAgent || DEFAULT_UA,
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -382,7 +415,7 @@ export async function fetchFastPath(url, opts = {}) {
  * @returns {Promise<{url:string,status:number,buffer:Buffer,contentType:string,via:string}|null>}
  */
 export async function fetchBinaryFastPath(url, opts = {}) {
-  const { cookies, userAgent, headers, timeout = 20000 } = opts;
+  const { cookies, userAgent, headers, timeout = 20000, dispatcher } = opts;
   const cookieHeader = (cookies || [])
     .filter((c) => c && c.name)
     .map((c) => `${c.name}=${c.value}`)
@@ -393,6 +426,7 @@ export async function fetchBinaryFastPath(url, opts = {}) {
     res = await fetch(url, {
       redirect: 'follow',
       signal: AbortSignal.timeout(timeout),
+      ...(dispatcher ? { dispatcher } : {}),
       headers: {
         'user-agent': userAgent || DEFAULT_UA,
         accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
@@ -464,6 +498,7 @@ export async function fetchProxyFastPath(url, opts = {}) {
     body,
     redirect = 'follow',
     timeout = 20000,
+    dispatcher,
   } = opts;
 
   const clearanceCookie = (cookies || [])
@@ -490,6 +525,7 @@ export async function fetchProxyFastPath(url, opts = {}) {
       redirect,
       body: body != null ? body : undefined,
       signal: AbortSignal.timeout(timeout),
+      ...(dispatcher ? { dispatcher } : {}),
       headers: {
         'user-agent': userAgent || DEFAULT_UA,
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -544,9 +580,12 @@ export async function save(page, dir = 'json') {
   return { cookiesPath, pagePath };
 }
 
-// Run directly: `node index.js`
-if (import.meta.url === `file://${process.argv[1]}` ||
-    import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href) {
+// Run directly: `node index.js`. Guard on argv[1] — it's undefined when the
+// module is imported without a script path (e.g. `node --eval`), and the URL
+// build below would throw on import otherwise.
+const entry = process.argv[1];
+if (entry && (import.meta.url === `file://${entry}` ||
+    import.meta.url === new URL(`file:///${entry.replace(/\\/g, '/')}`).href)) {
   const url = process.argv[2];
   if (!url) {
     console.error('Usage: node index.js <url>');

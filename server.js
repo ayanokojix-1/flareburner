@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import process from 'process';
 import { fileURLToPath } from 'url';
+import { ProxyAgent } from 'undici';
 import {
   BrowserPool,
   navigate,
@@ -48,10 +49,52 @@ const config = {
   headless: bool(env.HEADLESS, false),
   navTimeout: num(env.NAV_TIMEOUT, 60000),
   defaultUrl: env.DEFAULT_URL || 'https://nowsecure.nl',
+  debug: bool(env.DEBUG, false),
+  // Residential/mobile proxy. Set PROXY_HOST + PROXY_PORT (and optional
+  // PROXY_USER/PROXY_PASS) to route the browser AND the cookie-reuse fetches
+  // through it — the only way a datacenter host (DO) passes Cloudflare.
+  proxy:
+    env.PROXY_HOST && env.PROXY_PORT
+      ? {
+          host: env.PROXY_HOST,
+          port: num(env.PROXY_PORT, 0),
+          username: env.PROXY_USER || undefined,
+          password: env.PROXY_PASS || undefined,
+        }
+      : null,
+};
+
+// One shared dispatcher so the fast-path fetches exit via the SAME proxy IP the
+// browser solved on. cf_clearance is IP-bound; a direct fetch would mismatch and
+// get re-challenged, silently forcing a full browser solve on every request.
+const proxyDispatcher = config.proxy
+  ? new ProxyAgent(
+      config.proxy.username
+        ? `http://${encodeURIComponent(config.proxy.username)}:${encodeURIComponent(
+            config.proxy.password || '',
+          )}@${config.proxy.host}:${config.proxy.port}`
+        : `http://${config.proxy.host}:${config.proxy.port}`,
+    )
+  : undefined;
+
+// ---------------------------------------------------------------------------
+// Logging. `log`/`warn`/`error` always fire; `debug` only when DEBUG is set.
+// Every line is timestamped so it lines up with `journalctl`/`docker logs`.
+// ---------------------------------------------------------------------------
+const ts = () => new Date().toISOString();
+const log = (...a) => console.log(ts(), ...a);
+const warn = (...a) => console.warn(ts(), 'WARN', ...a);
+const logError = (...a) => console.error(ts(), 'ERROR', ...a);
+const debug = (...a) => {
+  if (config.debug) console.log(ts(), 'DEBUG', ...a);
 };
 
 const startedAt = Date.now();
-const pool = new BrowserPool({ size: config.poolSize, headless: config.headless });
+const pool = new BrowserPool({
+  size: config.poolSize,
+  headless: config.headless,
+  proxy: config.proxy || undefined,
+});
 
 // Most-recently-harvested Cloudflare clearance (cookies + UA). Lets the binary
 // /binary endpoint fetch protected images via a plain fetch — no browser, fully
@@ -139,7 +182,8 @@ async function scrape(opts) {
     cookies.length > 0;
 
   if (fastEligible) {
-    const fast = await fetchFastPath(url, { cookies, userAgent, headers, timeout });
+    const fast = await fetchFastPath(url, { cookies, userAgent, headers, timeout, dispatcher: proxyDispatcher });
+    if (!fast) debug(`/v1 ${url}: fast-path challenged, falling back to browser`);
     if (fast) {
       if (returnType === 'json') {
         try {
@@ -179,10 +223,12 @@ async function scrape(opts) {
       } catch (err) {
         lastErr = err;
         if (!isTransientNavError(err)) throw err;
+        warn(`/v1 ${url}: transient nav error (attempt ${attempt}/2), retrying:`, err.message);
       }
     }
     throw lastErr;
   } catch (err) {
+    warn(`/v1 ${url}: replacing broken browser slot after failure`);
     await pool.replace(slot); // recreate the (possibly broken) slot, then release
     throw err;
   }
@@ -205,8 +251,12 @@ async function fetchBinary(url, { timeout = config.navTimeout } = {}) {
       cookies: lastClearance.cookies,
       userAgent: lastClearance.userAgent,
       timeout,
+      dispatcher: proxyDispatcher,
     });
     if (fast) return fast;
+    debug(`/binary ${url}: fast-path challenged, solving via browser`);
+  } else {
+    debug(`/binary ${url}: no cached clearance yet, solving via browser`);
   }
 
   // 2) Browser path: navigate (solving any challenge), then read the bytes.
@@ -256,12 +306,16 @@ async function fetchProxy(url, opts = {}) {
       body,
       redirect,
       timeout,
+      dispatcher: proxyDispatcher,
     });
 
   // 1) Fast-path with whatever clearance we last harvested.
   if (lastClearance.cookies) {
     const fast = await tryFast(lastClearance);
     if (fast) return fast;
+    debug(`/fetch ${url}: fast-path challenged, solving origin via browser`);
+  } else {
+    debug(`/fetch ${url}: no cached clearance yet, solving origin via browser`);
   }
 
   // 2) Browser: solve Cloudflare for this origin, harvest clearance, then replay.
@@ -292,6 +346,9 @@ async function fetchProxy(url, opts = {}) {
 // ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+
+  // Trace every request (except the healthcheck's noise) when DEBUG is on.
+  if (pathname !== '/health') debug(`${req.method} ${pathname}`);
 
   if (pathname === '/health' && req.method === 'GET') {
     return sendJson(res, 200, {
@@ -347,8 +404,10 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const result = await scrape({ ...body, url });
+      debug(`/v1 ${url} -> ${result.via || 'browser'}`);
       return sendJson(res, 200, result);
     } catch (err) {
+      logError(`/v1 ${url} failed:`, err && err.stack ? err.stack : err);
       return sendJson(res, 500, { error: String(err && err.message ? err.message : err) });
     }
   }
@@ -374,11 +433,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const { status, buffer, contentType } = await fetchBinary(body.url.trim(), {
+      const { status, buffer, contentType, via } = await fetchBinary(body.url.trim(), {
         timeout: body.timeout,
       });
+      debug(`/binary ${body.url.trim()} -> ${via} ${status} ${contentType} ${buffer.length}b`);
       return sendBinary(res, status >= 200 && status < 300 ? 200 : status, buffer, contentType);
     } catch (err) {
+      logError(`/binary ${body.url.trim()} failed:`, err && err.stack ? err.stack : err);
       return sendJson(res, 502, { error: String(err && err.message ? err.message : err) });
     }
   }
@@ -411,8 +472,10 @@ const server = http.createServer(async (req, res) => {
         redirect: body.redirect,
         timeout: body.timeout,
       });
+      debug(`/fetch ${body.method || 'GET'} ${body.url.trim()} -> ${result.via} ${result.status}`);
       return sendJson(res, 200, result);
     } catch (err) {
+      logError(`/fetch ${body.url.trim()} failed:`, err && err.stack ? err.stack : err);
       return sendJson(res, 502, { error: String(err && err.message ? err.message : err) });
     }
   }
@@ -421,10 +484,26 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Last-resort handlers so a stray async error in the browser layer is logged
+// instead of vanishing (or silently killing the process with no trace).
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (reason) => {
+  logError('unhandledRejection:', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  logError('uncaughtException:', err && err.stack ? err.stack : err);
+});
+
+// ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 (async () => {
-  console.log(`flareburner: warming ${config.poolSize} browser(s) (headless=${config.headless})…`);
+  log(`flareburner: warming ${config.poolSize} browser(s) (headless=${config.headless}, debug=${config.debug})…`);
+  log(
+    config.proxy
+      ? `proxy: ON -> ${config.proxy.host}:${config.proxy.port}${config.proxy.username ? ' (authenticated)' : ''}`
+      : 'proxy: OFF (direct connection — datacenter IPs get flagged by Cloudflare)',
+  );
   await pool.init();
   server.listen(config.port, () => {
     console.log(`flareburner API listening on http://0.0.0.0:${config.port}`);
